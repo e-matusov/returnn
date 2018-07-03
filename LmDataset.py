@@ -883,7 +883,10 @@ class TranslationDataset(CachedDataset2):
     self.path = path
     self.file_postfix = file_postfix
     self.partition_epoch = partition_epoch
-    self._add_postfix = {"data": source_postfix, "classes": target_postfix}
+    self._main_data_key = "data"
+    self._main_classes_key = "classes"
+    self._add_postfix = {self._main_data_key: source_postfix, self._main_classes_key: target_postfix}
+    self._keys_to_read = [self._main_data_key, self._main_classes_key]
     from threading import Lock, Thread
     self._lock = Lock()
     self._partition_epoch_num_seqs = []
@@ -898,7 +901,7 @@ class TranslationDataset(CachedDataset2):
     self._vocabs = {data_key: self._get_vocab(prefix) for (prefix, data_key) in self.MapToDataKeys.items()}
     self.num_outputs = {k: [max(self._vocabs[k].values()) + 1, 1] for k in self._vocabs.keys()}  # all sparse
     assert all([v1 <= 2 ** 31 for (k, (v1, v2)) in self.num_outputs.items()])  # we use int32
-    self.num_inputs = self.num_outputs["data"][0]
+    self.num_inputs = self.num_outputs[self._main_data_key][0]
     self._reversed_vocabs = {k: self._reverse_vocab(k) for k in self._vocabs.keys()}
     self.labels = {k: self._get_label_list(k) for k in self._vocabs.keys()}
     self._unknown_label = unknown_label
@@ -906,6 +909,14 @@ class TranslationDataset(CachedDataset2):
     self._thread = Thread(name="%r reader" % self, target=self._thread_main)
     self._thread.daemon = True
     self._thread.start()
+
+  def _extendData(self, k, data_strs):
+    vocab = self._vocabs[k]
+    data = [
+      self._data_str_to_numpy(vocab, s.decode("utf8").strip() + self._add_postfix[k])
+      for s in data_strs]
+    with self._lock:
+      self._data[k].extend(data)
 
   def _thread_main(self):
     from Util import interrupt_main
@@ -917,30 +928,25 @@ class TranslationDataset(CachedDataset2):
       # First iterate once over the data to get the data len as fast as possible.
       data_len = 0
       while True:
-        ls = self._data_files["data"].readlines(10 ** 4)
+        ls = self._data_files[self._main_data_key].readlines(10 ** 4)
         data_len += len(ls)
         if not ls:
           break
       with self._lock:
         self._data_len = data_len
-      self._data_files["data"].seek(0, os.SEEK_SET)  # we will read it again below
+      self._data_files[self._main_data_key].seek(0, os.SEEK_SET)  # we will read it again below
 
       # Now, read and use the vocab for a compact representation in memory.
-      keys_to_read = ["data", "classes"]
+      keys_to_read = list(self._keys_to_read)
       while True:
-        for k in list(keys_to_read):
+        for k in keys_to_read:
           data_strs = self._data_files[k].readlines(10 ** 6)
           if not data_strs:
             assert len(self._data[k]) == self._data_len
             keys_to_read.remove(k)
             continue
           assert len(self._data[k]) + len(data_strs) <= self._data_len
-          vocab = self._vocabs[k]
-          data = [
-            self._data_str_to_numpy(vocab, s.decode("utf8").strip() + self._add_postfix[k])
-            for s in data_strs]
-          with self._lock:
-            self._data[k].extend(data)
+          self._extendData(k, data_strs)
         if not keys_to_read:
           break
       for k, f in list(self._data_files.items()):
@@ -1018,7 +1024,7 @@ class TranslationDataset(CachedDataset2):
       unknown_label_id = vocab[self._unknown_label]
       words_idxs = [vocab.get(w, unknown_label_id) for w in words]
     return numpy.array(words_idxs, dtype=numpy.int32)
-
+   
   def _get_data(self, key, line_nr):
     """
     :param str key: "data" or "classes"
@@ -1106,7 +1112,7 @@ class TranslationDataset(CachedDataset2):
     else:
       num_seqs = self._get_data_len()
       self._seq_order = self.get_seq_order_for_epoch(
-        epoch=epoch, num_seqs=num_seqs, get_seq_len=lambda i: len(self._get_data(key="data", line_nr=i)))
+        epoch=epoch, num_seqs=num_seqs, get_seq_len=lambda i: len(self._get_data(key=self._main_data_key, line_nr=i)))
       self._num_seqs = num_seqs
     if self.partition_epoch:
       self._partition_epoch_num_seqs = [self._num_seqs // self.partition_epoch] * self.partition_epoch
@@ -1123,8 +1129,8 @@ class TranslationDataset(CachedDataset2):
     if seq_idx >= self._num_seqs:
       return None
     line_nr = self._get_line_nr(seq_idx)
-    features = self._get_data(key="data", line_nr=line_nr)
-    targets = self._get_data(key="classes", line_nr=line_nr)
+    features = self._get_data(key=self._main_data_key, line_nr=line_nr)
+    targets = self._get_data(key=self._main_classes_key, line_nr=line_nr)
     assert features is not None and targets is not None
     return DatasetSeq(
       seq_idx=seq_idx,
@@ -1132,7 +1138,112 @@ class TranslationDataset(CachedDataset2):
       features=features,
       targets=targets)
 
+class AmbigInputTranslationDataset(TranslationDataset):
+  
+  def __init__(self, path, file_postfix, partition_epoch=None, source_postfix="", target_postfix="",
+               source_only=False,
+               unknown_label=None, max_density=20, **kwargs):
+    """
+    :param str path: the directory containing the files
+    :param str file_postfix: e.g. "train" or "dev". it will then search for "source." + postfix and "target." + postfix.
+    :param bool random_shuffle_epoch1: if True, will also randomly shuffle epoch 1. see self.init_seq_order().
+    :param int partition_epoch: if provided, will partition the dataset into multiple epochs
+    :param None|str source_postfix: will concat this at the end of the source. e.g.
+    :param None|str target_postfix: will concat this at the end of the target.
+      You might want to add some sentence-end symbol.
+    :param bool source_only: if targets are not available
+    :param str|None unknown_label: "UNK" or so. if not given, then will not replace unknowns but throw an error
+    :param int|12   max_density: the density of the confusion network: max number of arcs per slot
+    """
+    super(AmbigInputTranslationDataset, self).__init__(**kwargs)
+    self._main_data_key = "sparse_inputs"
+    self._keys_to_read = ["sparse_inputs", "classes"]
+    self.density = density
 
+  def _loadSingleConfusionNet(self, words, vocab, postfix):
+    """
+    :param list[str] words:
+    :param dict[str,int] vocab:
+    :param str postfix: 
+    :rtype: (numpy.ndarray, numpy.ndarray)
+    """
+    unknown_label_id = vocab[self._unknown_label]
+    offset = 0
+    if postfix != None:
+      postfixIndex = vocab.get(postfix, unknown_label_id)
+      if postfixIndex != unknown_label_id:
+        offset = 1
+    words_idxs = numpy.zeros(shape=(len(words) + offset, self.density), dtype=numpy.int32)
+    words_confs = numpy.zeros(shape=(len(words) + offset, self.density), dtype=numpy.float32)
+    for n in range(len(words)):
+      arcs = words[n].split("__")
+      for k in range(min(self.density, len(arcs))):
+        (arc, conf) = arcs[k].split("|")
+        words_idxs[n][k] = vocab.get(arc, unknown_label_id)
+        words_confs[n][k] = float(conf)
+    if offset != 0:
+      words_idxs[len(words)][0] = postfixIndex
+      words_confs[len(words)][0] = 1
+    return (words_idxs, words_confs)
+
+  def _data_str_to_sparse_inputs(self, vocab, s, postfix=None):
+    """
+    :param dict[str,int] vocab:
+    :param str s:
+    :param str postfix:
+    :rtype: (numpy.ndarray, numpy.ndarray)
+    """
+    words = s.split()
+    if words[0] == "__ALT__":
+        return self._loadSingleConfusionNet(words.pop(0), vocab, postfix)
+
+    if postfix != None:
+      words.append(postfix)
+    unknown_label_id = vocab[self._unknown_label]
+    words_idxs = numpy.zeros(shape=(len(words), self.density), dtype=numpy.int32)
+    words_confs = numpy.zeros(shape=(len(words), self.density), dtype=numpy.float32)    
+    for n in range(len(words_idxs)):
+          words_idxs[n][0] = vocab.get(w, unknown_label_id)
+          words_confs[n][0] = 1
+    return (words_idxs, words_confs)
+
+  def _extendData(self, k, data_strs):
+    """
+    :param str key: the key ("sparse_inputs", or "classes")
+    :param list[str] data_strs: array of input for the key
+    """
+    if k == self._main_data_key: # the sparse inputs and weights
+      vocab = self._vocabs[k]     
+      idx_data = []
+      conf_data = []
+      for s in data_strs:
+        (words_idxs, words_confs) = self._data_str_to_sparse_inputs(vocab, s.decode("utf8").strip(), self._add_postfix[k])
+        idx_data.append(words_idxs)
+        conf_data.append(words_confs)
+      with self._lock:
+        self._data[k].extend(idx_data)
+        self._data["sparse_weights"].extend(conf_data)
+    else: # the classes
+      data = [
+        self._data_str_to_numpy(vocab, s.decode("utf8").strip() + self._add_postfix[k])
+        for s in data_strs]
+      with self._lock:
+        self._data[k].extend(data)
+
+  def _collect_single_seq(self, seq_idx):
+    if seq_idx >= self._num_seqs:
+      return None
+    line_nr = self._get_line_nr(seq_idx)
+    features = self._get_data(key=self._main_data_key, line_nr=line_nr)
+    targets = {"classes": self._get_data(key="classes", line_nr=line_nr), 
+               "sparse_weights": self._get_data(key="sparse_weights", line_nr=line_nr)}
+    assert features is not None and targets is not None
+    return DatasetSeq(
+      seq_idx=seq_idx,
+      seq_tag="line-%i" % line_nr,
+      features=features,
+      targets=targets)
+     
 def _main(argv):
   import better_exchook
   better_exchook.install()
