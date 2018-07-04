@@ -1200,7 +1200,8 @@ class AmbigInputTranslationDataset(TranslationDataset):
     """
     words = s.split()
     if words[0] == "__ALT__":
-        return self._loadSingleConfusionNet(words.pop(0), vocab, postfix)
+        words.pop(0)
+        return self._loadSingleConfusionNet(words, vocab, postfix)
 
     if postfix != None:
       words.append(postfix)
