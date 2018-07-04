@@ -864,6 +864,8 @@ class TranslationDataset(CachedDataset2):
   """
 
   MapToDataKeys = {"source": "data", "target": "classes"}  # just by our convention
+  _main_data_key = None
+  _main_classes_key = None
 
   def __init__(self, path, file_postfix, partition_epoch=None, source_postfix="", target_postfix="",
                source_only=False,
@@ -883,8 +885,10 @@ class TranslationDataset(CachedDataset2):
     self.path = path
     self.file_postfix = file_postfix
     self.partition_epoch = partition_epoch
-    self._main_data_key = "data"
-    self._main_classes_key = "classes"
+    if self._main_data_key == None:
+      self._main_data_key = "data"
+    if self._main_classes_key == None:
+      self._main_classes_key = "classes"
     self._add_postfix = {self._main_data_key: source_postfix, self._main_classes_key: target_postfix}
     self._keys_to_read = [self._main_data_key, self._main_classes_key]
     from threading import Lock, Thread
@@ -1140,9 +1144,7 @@ class TranslationDataset(CachedDataset2):
 
 class AmbigInputTranslationDataset(TranslationDataset):
   
-  def __init__(self, path, file_postfix, partition_epoch=None, source_postfix="", target_postfix="",
-               source_only=False,
-               unknown_label=None, max_density=20, **kwargs):
+  def __init__(self, max_density=20, **kwargs):
     """
     :param str path: the directory containing the files
     :param str file_postfix: e.g. "train" or "dev". it will then search for "source." + postfix and "target." + postfix.
@@ -1155,10 +1157,13 @@ class AmbigInputTranslationDataset(TranslationDataset):
     :param str|None unknown_label: "UNK" or so. if not given, then will not replace unknowns but throw an error
     :param int|12   max_density: the density of the confusion network: max number of arcs per slot
     """
-    super(AmbigInputTranslationDataset, self).__init__(**kwargs)
+    self.MapToDataKeys["source"] = "sparse_inputs"
     self._main_data_key = "sparse_inputs"
     self._keys_to_read = ["sparse_inputs", "classes"]
-    self.density = density
+    self.density = max_density
+    super(AmbigInputTranslationDataset, self).__init__(**kwargs)
+    if "sparse_weights" not in self._data.keys():
+      self._data["sparse_weights"] = []
 
   def _loadSingleConfusionNet(self, words, vocab, postfix):
     """
@@ -1201,9 +1206,9 @@ class AmbigInputTranslationDataset(TranslationDataset):
       words.append(postfix)
     unknown_label_id = vocab[self._unknown_label]
     words_idxs = numpy.zeros(shape=(len(words), self.density), dtype=numpy.int32)
-    words_confs = numpy.zeros(shape=(len(words), self.density), dtype=numpy.float32)    
+    words_confs = numpy.zeros(shape=(len(words), self.density), dtype=numpy.float32)
     for n in range(len(words_idxs)):
-          words_idxs[n][0] = vocab.get(w, unknown_label_id)
+          words_idxs[n][0] = vocab.get(words[n], unknown_label_id)
           words_confs[n][0] = 1
     return (words_idxs, words_confs)
 
@@ -1212,8 +1217,8 @@ class AmbigInputTranslationDataset(TranslationDataset):
     :param str key: the key ("sparse_inputs", or "classes")
     :param list[str] data_strs: array of input for the key
     """
+    vocab = self._vocabs[k]
     if k == self._main_data_key: # the sparse inputs and weights
-      vocab = self._vocabs[k]     
       idx_data = []
       conf_data = []
       for s in data_strs:
