@@ -173,14 +173,14 @@ class ExternData(object):
 
 
 class TFNetwork(object):
-  def __init__(self, config=None, extern_data=None, rnd_seed=42,
+  def __init__(self, config=None, extern_data=None, rnd_seed=None,
                train_flag=False, eval_flag=False, search_flag=False,
                parent_layer=None, parent_net=None, extra_parent_net=None,
                name=None):
     """
     :param Config.Config config: only needed to init extern_data if not specified explicitly
     :param ExternData|None extern_data:
-    :param int rnd_seed:
+    :param int|None rnd_seed:
     :param bool|tf.Tensor train_flag: True if we want to use this model in training, False if in eval, or dynamic
     :param bool eval_flag: whether to calculate losses. if train_flag is not False, this will be set to True
     :param bool search_flag: whether we perform a beam-search. see usage
@@ -206,6 +206,11 @@ class TFNetwork(object):
     self.extern_data = extern_data
     self._config = config
     self.used_data_keys = set()  # type: set[str]  # keys from extern_data
+    if rnd_seed is None:
+      if parent_net:
+        rnd_seed = parent_net.random.randint(2 ** 31)
+      else:
+        rnd_seed = 42
     self.rnd_seed = rnd_seed
     self.random = numpy.random.RandomState(rnd_seed)
     assert isinstance(train_flag, (bool, tf.Tensor))
@@ -240,7 +245,6 @@ class TFNetwork(object):
     self._assigner_cache = {}  # type: dict[tf.Variable,VariableAssigner]
     self.concat_sources_dropout_cache = {}  # type: dict[(tuple[LayerBase],float),Data]
     self._batch_dim = None  # see get_batch_dim
-    self.post_control_dependencies = []
 
   def __repr__(self):
     s = "TFNetwork %r" % self.name
@@ -446,6 +450,7 @@ class TFNetwork(object):
           layer_desc["output"] = layer_class.get_out_data_from_opts(**layer_desc)
         if debug_print_layer_output_template:
           print("layer %s/%r output: %r" % (self.name, name, layer_desc["output"]))
+        assert isinstance(layer_desc["output"], Data)
         layer = layer_class(**layer_desc)
       except TypeError:
         help_on_type_error_wrong_args(cls=layer_class, kwargs=list(layer_desc.keys()))
@@ -728,6 +733,8 @@ class TFNetwork(object):
     for layer_name, layer in sorted(self.layers.items()):
       assert isinstance(layer, LayerBase)
       for param_name, param in sorted(layer.get_saveable_params_dict().items()):
+        if param in l:  # could happen with reuse_params
+          continue
         l.append(param)
     l += self.get_auxiliary_params()
     l += self.extra_vars_to_save
@@ -1177,19 +1184,25 @@ class TFNetwork(object):
       return Config()
     return None
 
-  def register_post_control_dependencies(self, deps):
+  @staticmethod
+  def register_post_control_dependencies(deps):
     """
     Will register the control dependencies
     or globally for a session run on this network.
     This can e.g. be called inside `self.post_init`.
+    We use UPDATE_OPS, as that is also e.g. used by batchnorm. See:
+      https://github.com/tensorflow/tensorflow/issues/1122
 
     :param list[tf.Tensor|tf.Operation] deps:
     :return: nothing
     """
-    if self.parent_net:
-      self.parent_net.register_post_control_dependencies(deps)
-      return
-    self.post_control_dependencies.extend(deps)
+    ls = tf.get_collection_ref(tf.GraphKeys.UPDATE_OPS)
+    assert isinstance(ls, list)
+    ls.extend(deps)
+
+  @staticmethod
+  def get_post_control_dependencies():
+    return tf.get_collection(tf.GraphKeys.UPDATE_OPS)
 
   @classmethod
   def get_network_stack(cls):

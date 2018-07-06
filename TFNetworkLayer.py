@@ -1527,6 +1527,13 @@ class CopyLayer(_ConcatInputLayer):
     return get_concat_sources_data_template(sources, name="%s_output" % name)
 
 
+class DropoutLayer(CopyLayer):
+  """
+  Just the same as :class:`CopyLayer`, because that one already supports dropout.
+  """
+  layer_class = "dropout"
+
+
 class InternalLayer(LayerBase):
   """
   This is not supposed to be used by the user.
@@ -1793,6 +1800,7 @@ class LinearLayer(_ConcatInputLayer):
   Linear/forward/fully-connected/1x1-conv layer.
   Does a linear transformation on the feature-dimension of the input
   with an optional bias term and an optional activation function.
+  See also :class:`DotLayer`, :class:`ElemwiseProdLayer`, :class:`WeightedSumLayer`.
   """
   layer_class = "linear"
 
@@ -1885,7 +1893,7 @@ class SoftmaxLayer(LinearLayer):
     super(SoftmaxLayer, self).__init__(activation=activation, **kwargs)
 
 
-class SampledSoftmax(_ConcatInputLayer):
+class SampledSoftmaxLayer(_ConcatInputLayer):
   """
   This layer is a modified version of the linear layer using softmax as activation function.
   The main difference is, that the weight matrix is created transposed (see note to self.W
@@ -1900,7 +1908,7 @@ class SampledSoftmax(_ConcatInputLayer):
     :param str forward_weights_init: see :func:`TFUtil.get_initializer`
     :param str|float bias_init: see :func:`TFUtil.get_initializer`
     """
-    super(SampledSoftmax, self).__init__(**kwargs)
+    super(SampledSoftmaxLayer, self).__init__(**kwargs)
 
     # Start by looking up sizes of input and output
     from TFUtil import get_initializer
@@ -1962,7 +1970,7 @@ class SampledSoftmax(_ConcatInputLayer):
 
 class LengthLayer(LayerBase):
   """
-  Returns the length of sources as (B,).
+  Returns the length of sources as (B,), via input size_placeholder.
   """
   layer_class = "length"
 
@@ -2000,12 +2008,11 @@ class SoftmaxOverSpatialLayer(_ConcatInputLayer):
   """
   layer_class = "softmax_over_spatial"
 
-  def __init__(self, energy_factor=None, energy_mask="sequence", window_start=None, window_size=10, **kwargs):
+  def __init__(self, energy_factor=None, window_start=None, window_size=10, **kwargs):
     """
     :param float|None energy_factor: the energy will be scaled by this factor.
       This is like a temperature for the softmax.
       In Attention-is-all-you-need, this is set to 1/sqrt(base_ctx.dim).
-    :param str energy_mask: either "sequence" (for masking the sequence) or "window"
     :param LayerBase|None window_start: Tensor of shape (B,) indicating the window start
     :param int window_size:
     """
@@ -2020,11 +2027,8 @@ class SoftmaxOverSpatialLayer(_ConcatInputLayer):
     assert energy_data.have_time_axis()
     # if the time-axis is static, we can skip the masking
     if energy_data.is_time_axis_dynamic():
-      if energy_mask == "sequence":
-        # We must mask all values behind seq_lens. Set them to -inf, because we use softmax afterwards.
-        energy_mask = energy_data.get_sequence_mask()
-      elif energy_mask == "window":
-        assert window_start is not None
+      energy_mask = energy_data.get_sequence_mask()
+      if window_start is not None:
         from TFUtil import nd_indices, expand_dims_unbroadcast
         window_start = window_start.output.get_placeholder_as_batch_major()
         n_batch = energy_shape[energy_data.batch_dim_axis]
@@ -2035,8 +2039,9 @@ class SoftmaxOverSpatialLayer(_ConcatInputLayer):
         idxs = nd_indices(indices)
         mask_shape = energy_shape[:2]  # (T, B)
         mask_shape[energy_data.time_dim_axis] = window_size  # (W, B) | (B, W)
-        energy_mask = tf.scatter_nd(idxs, tf.ones(shape=mask_shape), energy_shape[:2])
-        energy_mask = tf.cast(energy_mask, tf.bool)
+        energy_mask_window = tf.scatter_nd(idxs, tf.ones(shape=mask_shape), energy_shape[:2])
+        energy_mask_window = tf.cast(energy_mask_window, tf.bool)
+        energy_mask = tf.logical_and(energy_mask, energy_mask_window)
       energy_mask_flat = tf.reshape(energy_mask, [numpy.prod(energy_shape[:2])], name="energy_mask_flat")
       energy_flat = tf.reshape(energy, [numpy.prod(energy_shape[:2])] + energy_shape[2:], name="energy_flat")
       energy_flat = tf.where(energy_mask_flat, energy_flat, float("-inf") * tf.ones_like(energy_flat), "energy_masked")
@@ -2059,6 +2064,40 @@ class SoftmaxOverSpatialLayer(_ConcatInputLayer):
     super(SoftmaxOverSpatialLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)
     if d.get("window_start", None):
       d["window_start"] = get_layer(d["window_start"])
+
+
+class SeqLenMaskLayer(_ConcatInputLayer):
+  """
+  Masks some values away given the seq_len_source with mask_value.
+  """
+  layer_class = "seq_len_mask"
+
+  def __init__(self, seq_len_source, axis, mask_value, **kwargs):
+    """
+    :param LayerBase seq_len_source:
+    :param str|int axis:
+    :param float mask_value:
+    """
+    super(SeqLenMaskLayer, self).__init__(**kwargs)
+    x = self.input_data.copy_as_batch_major()  # e.g. (B,T',T)
+    axis = x.get_axis_from_description(axis)
+    energy_mask = seq_len_source.output.copy_as_batch_major().get_sequence_mask()  # e.g. (B,T)
+    from TFUtil import expand_multiple_dims
+    energy_mask = expand_multiple_dims(
+      energy_mask, [i for i in range(x.batch_ndim) if i not in [x.batch_dim_axis, axis]])  # e.g. (B,1,T) with axis=-1
+    energy_mask = tf.logical_and(energy_mask, tf.ones_like(x.placeholder, dtype=energy_mask.dtype))
+    x_ = tf.where(energy_mask, x.placeholder, mask_value * tf.ones_like(x.placeholder), "energy_masked")
+    self.output.placeholder = x_
+    self.output.size_placeholder = x.size_placeholder.copy()
+
+  @classmethod
+  def transform_config_dict(cls, d, network, get_layer):
+    super(SeqLenMaskLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)
+    d["seq_len_source"] = get_layer(d["seq_len_source"])
+
+  @classmethod
+  def get_out_data_from_opts(cls, name, sources, **kwargs):
+    return get_concat_sources_data_template(sources, name="%s_output" % name).copy_as_batch_major()
 
 
 class BatchSoftmaxLayer(_ConcatInputLayer):
@@ -2644,6 +2683,49 @@ class ExpandDimsLayer(_ConcatInputLayer):
     return data
 
 
+class SwapAxesLayer(_ConcatInputLayer):
+  """
+  Swaps two axes. Basically a wrapper around :func:`TFUtil.swapaxes`.
+  See also :class:`ReinterpretDataLayer`.
+  """
+  layer_class = "swap_axes"
+
+  def __init__(self, axis1, axis2, **kwargs):
+    """
+    :param int|str axis1:
+    :param int|str axis2:
+    """
+    super(SwapAxesLayer, self).__init__(**kwargs)
+    from TFUtil import swapaxes
+    axis1 = self.input_data.get_axis_from_description(axis1)
+    axis2 = self.input_data.get_axis_from_description(axis2)
+    self.output.placeholder = swapaxes(self.input_data.placeholder, axis1=axis1, axis2=axis2)
+    self.output.size_placeholder = self.input_data.size_placeholder.copy()  # might be wrong, not checking that now...
+
+  @classmethod
+  def get_out_data_from_opts(cls, name, sources, axis1, axis2, **kwargs):
+    """
+    :param str name:
+    :param list[LayerBase] sources:
+    :param int|str axis1:
+    :param int|str axis2:
+    :rtype: Data
+    """
+    out = get_concat_sources_data_template(sources, name="%s_output" % name)
+    axis1 = out.get_axis_from_description(axis1)
+    axis2 = out.get_axis_from_description(axis2)
+    assert axis1 != axis2, "would be no-op. currently this is an error."
+    assert axis1 != out.batch_dim_axis and axis2 != out.batch_dim_axis, "currently not supported..."
+    axis1_wo_b = out.get_batch_axis_excluding_batch(axis1)
+    axis2_wo_b = out.get_batch_axis_excluding_batch(axis2)
+    shape = list(out.shape)
+    shape[axis1_wo_b], shape[axis2_wo_b] = shape[axis2_wo_b], shape[axis1_wo_b]
+    out.shape = tuple(shape)
+    if not out.sparse:
+      out.dim = out.shape[-1]
+    return out
+
+
 class ReinterpretDataLayer(_ConcatInputLayer):
   """
   Acts like the :class:`CopyLayer` but reinterprets the role of some axes or data.
@@ -3173,6 +3255,10 @@ class WeightedSumLayer(_ConcatInputLayer):
   """
   Calculates a weighted sum, either over a complete axis of fixed dimension, or over some window.
   Can also do that for multiple axes.
+  The weights are a trainable parameter matrix.
+  Similar would be to use :class:`ElemwiseProdLayer` and :class:`ReduceLayer`,
+  or just a :class:`DotLayer` with a :class:`VariableLayer`.
+  See also :class:`LinearLayer`.
   """
   layer_class = "weighted_sum"
 
@@ -3295,6 +3381,8 @@ class ElemwiseProdLayer(_ConcatInputLayer):
   """
   Element-wise product in some axes.
   Microsoft calls this "static attention", in Deep Conv. NN with Layer-wise Context Expansion and Attention (LACE).
+  The matrix/tensor to be used for the product are given as a trainable parameter.
+  See also :class:`LinearLayer`.
   """
   layer_class = "elemwise_prod"
 
@@ -3362,12 +3450,13 @@ class DotLayer(LayerBase):
   """
   layer_class = "dot"
 
-  def __init__(self, red1=-1, red2=-2, var1=-2, var2=-1, debug=False, **kwargs):
+  def __init__(self, red1=-1, red2=-2, var1=-2, var2=-1, add_var2_if_empty=True, debug=False, **kwargs):
     """
     :param str|int|tuple[str|int] red1: reduce axes of first source
     :param str|int|tuple[str|int] red2: reduce axes of second source
     :param str|int|tuple[str|int]|None var1: var axes of first source
     :param str|int|tuple[str|int]|None var2: var axes of second source
+    :param bool add_var2_if_empty: if var2=None, add dim=1 at the end
     :param bool debug: will print debug shapes, etc.
     """
     from TFUtil import prod
@@ -3446,7 +3535,10 @@ class DotLayer(LayerBase):
       b = tf.reshape(b, b_rem_dims + [b_var_dim, b_reduce_dim])
     # `res` will be of shape: a_rem_dims + [a_var_dim, b_var_dim]
     res = tf.matmul(a, b, transpose_a=transpose_a, transpose_b=transpose_b)
-    res = tf.reshape(res, a_rem_dims + a_var_dims + (b_var_dims or [1]))
+    if not b_var_dims and add_var2_if_empty:
+      b_var_dims.append(1)
+      b_var_axes.append(None)
+    res = tf.reshape(res, a_rem_dims + a_var_dims + b_var_dims)
     self.output.placeholder = res
     # Collect dynamic size info.
     self.output.size_placeholder = {}
@@ -3473,13 +3565,13 @@ class DotLayer(LayerBase):
   @staticmethod
   def _axis2_to_output(axis, b_rem_axes, a_var_axes, b_var_axes):
     # Output will be of shape a_rem_dims + [a_var_dim, b_var_dim].
-    out_axes = b_rem_axes + [None for i in a_var_axes] + (b_var_axes or [None])
+    out_axes = b_rem_axes + [None for i in a_var_axes] + b_var_axes
     if axis not in out_axes:
       return None
     return out_axes.index(axis)
 
   @classmethod
-  def get_out_data_from_opts(cls, name, sources, red1=-1, red2=-2, var1=-2, var2=-1, **kwargs):
+  def get_out_data_from_opts(cls, name, sources, red1=-1, red2=-2, var1=-2, var2=-1, add_var2_if_empty=True, **kwargs):
     """
     :param str name:
     :param list[LayerBase] sources:
@@ -3487,6 +3579,7 @@ class DotLayer(LayerBase):
     :param str|int|tuple[str|int] red2: reduce axes of second source
     :param str|int|tuple[str|int]|None var1: var axes of first source
     :param str|int|tuple[str|int]|None var2: var axes of second source
+    :param bool add_var2_if_empty:
     :rtype: Data
     """
     import numpy
@@ -3514,9 +3607,11 @@ class DotLayer(LayerBase):
     if time_dim_axis is None and b_out.time_dim_axis is not None:
       time_dim_axis = cls._axis2_to_output(
         b_out.time_dim_axis, b_rem_axes=b_rem_axes, a_var_axes=a_var_axes, b_var_axes=b_var_axes)
+    if not b_var_dims and add_var2_if_empty:
+      b_var_dims.append(1)
     return Data(
       name="%s_output" % name,
-      shape=tuple(a_rem_dims[1:] + a_var_dims + (b_var_dims or [1])),
+      shape=tuple(a_rem_dims[1:] + a_var_dims + b_var_dims),
       batch_dim_axis=0,
       time_dim_axis=time_dim_axis,
       dtype=a_out.dtype)
@@ -3524,8 +3619,10 @@ class DotLayer(LayerBase):
 
 class ShiftAxisLayer(_ConcatInputLayer):
   """
-  Shifts a axis around.
+  Shifts the dimensions in an axis around.
   This layer may change the axis-dimension.
+
+  This name might be confusing. No axis will be shifted here. See :class:`SwapAxesLayer` for that.
   """
   layer_class = "shift_axis"
 
@@ -4309,35 +4406,74 @@ class AccumulateMeanLayer(ReduceLayer):
 class FastBaumWelchLayer(_ConcatInputLayer):
   """
   Calls :func:`fast_baum_welch` or :func:`fast_baum_welch_by_sprint_automata`.
-  We expect that our input are +log scores.
+  We expect that our input are +log scores, e.g. use log-softmax.
   """
   layer_class = "fast_bw"
   recurrent = True
 
-  def __init__(self, align_target, sprint_opts=None, tdp_scale=1.0, **kwargs):
+  def __init__(self, align_target, sprint_opts=None,
+               input_type="log_prob",
+               tdp_scale=1.0, am_scale=1.0, min_prob=0.0,
+               staircase_seq_len_source=None,
+               **kwargs):
     """
-    :param str align_target: e.g. "sprint"
+    :param str align_target: e.g. "sprint" or "staircase"
     :param dict[str] sprint_opts:
+    :param str input_type: "log_prob" or "prob"
     :param float tdp_scale:
+    :param float am_scale:
+    :param float min_prob: clips the minimum prob (value in [0,1])
+    :param LayerBase|None staircase_seq_len_source:
     """
+    import numpy
     super(FastBaumWelchLayer, self).__init__(**kwargs)
-    assert align_target == "sprint", "not yet implemented otherwise, align_target %r" % align_target
     data = self.input_data.copy_as_time_major()
-    from TFUtil import sequence_mask_time_major
-    seq_mask = sequence_mask_time_major(data.get_sequence_lengths())
-    from TFNativeOp import fast_baum_welch_by_sprint_automata
-    seq_tags = self.network.get_seq_tags()
-    fwdbwd, obs_scores = fast_baum_welch_by_sprint_automata(
-      sprint_opts=sprint_opts,
-      tdp_scale=tdp_scale,
-      am_scores=-data.placeholder,  # it wants the scores in -log space
-      float_idx=seq_mask,
-      tags=seq_tags)
+    # We want the scores in -log space.
+    if input_type == "log_prob":
+      am_scores = -data.placeholder
+    elif input_type == "prob":
+      if len(self.sources) == 1 and self.sources[0].output_before_activation:
+        am_scores = -self.sources[0].output_before_activation.get_log_output()
+        if self.sources[0].output.is_batch_major:
+          from TFUtil import swapaxes
+          am_scores = swapaxes(am_scores, 0, 1)
+      else:
+        from TFUtil import safe_log
+        am_scores = -safe_log(data.placeholder)
+    else:
+      raise Exception("%s: invalid input_type %r" % (self, input_type))
+    if min_prob > 0:
+      am_scores = tf.minimum(am_scores, -numpy.log(min_prob))  # in -log space
+    if am_scale != 1:
+      am_scores *= am_scale
+    if align_target == "sprint":
+      from TFUtil import sequence_mask_time_major
+      seq_mask = sequence_mask_time_major(data.get_sequence_lengths())
+      from TFNativeOp import fast_baum_welch_by_sprint_automata
+      seq_tags = self.network.get_seq_tags()
+      fwdbwd, obs_scores = fast_baum_welch_by_sprint_automata(
+        sprint_opts=sprint_opts,
+        tdp_scale=tdp_scale,
+        am_scores=am_scores,
+        float_idx=seq_mask,
+        tags=seq_tags)
+    elif align_target == "staircase":
+      from TFNativeOp import fast_baum_welch_staircase
+      fwdbwd, obs_scores = fast_baum_welch_staircase(
+        am_scores=am_scores, seq_lens=staircase_seq_len_source.output.get_sequence_lengths())
+    else:
+      raise Exception("%s: invalid align_target %r" % (self, align_target))
     loss = tf.reduce_sum(obs_scores[0])
     self.output_loss = loss
     bw = tf.exp(-fwdbwd)
     self.output.placeholder = bw
     self.output.size_placeholder = data.size_placeholder.copy()
+
+  @classmethod
+  def transform_config_dict(cls, d, network, get_layer):
+    super(FastBaumWelchLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)
+    if d.get("staircase_seq_len_source"):
+      d["staircase_seq_len_source"] = get_layer(d["staircase_seq_len_source"])
 
   @classmethod
   def get_out_data_from_opts(cls, name, sources, **kwargs):
@@ -4680,11 +4816,13 @@ class Loss(object):
     Does some checks on self.target and self.output, e.g. if the dense shapes matches.
     You can overwrite this if those checks don't make sense for your derived loss class.
     """
+    if not self.target:
+      return
     assert self.target.ndim_dense == self.output.ndim_dense, (
       "Number of dimensions mismatch. Target: %s, output: %s" % (self.target, self.output))
     expected_output_dim = self.get_auto_output_layer_dim(self.target.dim)
     assert expected_output_dim == self.output.dim, (
-      "Expected output dim is %i but the output has dim %i. " % (expected_output_dim, self.output.dim) +
+      "Expected output dim is %i but the output has dim %r. " % (expected_output_dim, self.output.dim) +
       "Target: %s, output: %s" % (self.target, self.output))
 
   def get_error(self):
@@ -5323,7 +5461,7 @@ class DeepClusteringLoss(Loss):
       "Number of dimensions mismatch. Target: %s, output: %s" % (self.target, self.output))
     expected_output_dim = self._embedding_dimension * ( self.target.shape[1] / self._nr_of_sources)
     assert expected_output_dim == self.output.dim, (
-      "Expected output dim is %i but the output has dim %i. " % (expected_output_dim, self.output.dim) +
+      "Expected output dim is %i but the output has dim %r. " % (expected_output_dim, self.output.dim) +
       "Target: %s, output: %s" % (self.target, self.output))
 
   def get_error(self):
@@ -5574,7 +5712,10 @@ class ViaLayerLoss(Loss):
       else:
         assert self.align_layer
         error_signal = self.output.placeholder - self.align_layer.output.copy_compatible_to(self.output).placeholder
-      error_signal *= tf.cast(self.output.get_sequence_mask_broadcast(), dtype=tf.float32)
+      seq_mask_bc = self.output.get_sequence_mask_broadcast()
+      error_signal = tf.where(
+        tf.logical_and(seq_mask_bc, tf.ones_like(error_signal, dtype=tf.bool)),
+        error_signal, tf.zeros_like(error_signal))
       if self.loss_wrt_to_act_in:
         assert self.output_with_activation, "activation unknown, via %r" % self.output
         if isinstance(self.loss_wrt_to_act_in, (str, unicode)):
@@ -5631,7 +5772,7 @@ class SampledSoftmaxLoss(Loss):
     self.sampler = sampler
 
   def get_value(self):
-    assert isinstance(self.layer, SampledSoftmax)
+    assert isinstance(self.layer, SampledSoftmaxLayer)
     assert self.target.sparse, "Sampled softmax is only useful for big (i.e. sparse) target vectors"
     assert self.target.ndim_dense == self.output.ndim_dense
 

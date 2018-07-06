@@ -158,8 +158,8 @@ class Runner(object):
           # mem_usage_for_dev currently only works for GPU
           continue
         d["mem_usage:%s" % os.path.basename(dev.name.replace("/device:", "/"))] = mem_usage_for_dev(dev.name)
-    if self.engine.network.post_control_dependencies:
-      d["post_control_dependencies"] = self.engine.network.post_control_dependencies
+    if self.engine.network.get_post_control_dependencies():
+      d["post_control_dependencies"] = self.engine.network.get_post_control_dependencies()
     return d
 
   def _print_process(self, report_prefix, step, step_duration, eval_info):
@@ -862,7 +862,13 @@ class Engine(object):
     self._maybe_update_config(net_desc=net_desc, epoch=epoch)
     # The new session will by default use the newly created default graph.
     self._make_tf_session()
-    tf.set_random_seed(42)
+    tf_random_seed = 42
+    net_random_seed = epoch
+    if self.config.opt_typed_value("random_seed", None):
+      seed = self.config.int("random_seed", None)
+      net_random_seed = (epoch * 3 + seed * 5 + 7) % (2 ** 31)
+      tf_random_seed = (net_random_seed * 2 + 3) % (2 ** 31)
+    tf.set_random_seed(tf_random_seed)
     from TFUtil import get_global_train_flag_placeholder
     if self.use_dynamic_train_flag:
       train_flag = get_global_train_flag_placeholder()
@@ -874,7 +880,7 @@ class Engine(object):
       # TODO...
     self.network, self.updater = self.create_network(
       config=self.config,
-      rnd_seed=epoch,
+      rnd_seed=net_random_seed,
       train_flag=train_flag, eval_flag=self.use_eval_flag, search_flag=self.use_search_flag,
       initial_learning_rate=getattr(self, "initial_learning_rate", None),
       net_dict=net_desc)
