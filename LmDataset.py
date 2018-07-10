@@ -883,7 +883,7 @@ class TranslationDataset(CachedDataset2):
       target.vocab.pkl
   """
 
-  MapToDataKeys = {"source": "data", "target": "classes"}  # just by our convention
+  MapToDataKeys = {"target": "classes"}  # just by our convention
   _main_data_key = None
   _main_classes_key = None
 
@@ -905,10 +905,12 @@ class TranslationDataset(CachedDataset2):
     self.path = path
     self.file_postfix = file_postfix
     self.partition_epoch = partition_epoch
-    if self._main_data_key == None:
+    if self._main_data_key is None:
       self._main_data_key = "data"
-    if self._main_classes_key == None:
+    if self._main_classes_key is None:
       self._main_classes_key = "classes"
+    if not "source" in self.MapToDataKeys.keys():
+      self.MapToDataKeys["source"] = "data"
     self._add_postfix = {self._main_data_key: source_postfix, self._main_classes_key: target_postfix}
     self._keys_to_read = [self._main_data_key, self._main_classes_key]
     from threading import Lock, Thread
@@ -1185,6 +1187,15 @@ class AmbigInputTranslationDataset(TranslationDataset):
     if "sparse_weights" not in self._data.keys():
       self._data["sparse_weights"] = []
 
+  def get_data(self, seq_idx, key):
+    if key == self._main_data_key:
+      return self.get_input_data(seq_idx)
+    else:
+      return self.get_targets(key, seq_idx)
+
+  def get_data_keys(self):
+    return ["sparse_inputs", "sparse_weights", "classes"]
+
   def is_data_sparse(self, key):
       if key == "sparse_weights":
         return False
@@ -1202,14 +1213,14 @@ class AmbigInputTranslationDataset(TranslationDataset):
   
   def get_data_dim(self, key):
     if key == "sparse_weights":
-      return super(AmbigInputTranslationDataset, self).get_data_dim(self._main_data_key) # always same dimension as sparase_inputs, read from one file
+      return super(AmbigInputTranslationDataset, self).get_data_dim(self._main_data_key) # always same dimension as sparse_inputs, read from one file
     return super(AmbigInputTranslationDataset, self).get_data_dim(key)
 
   def _loadSingleConfusionNet(self, words, vocab, postfix):
     """
     :param list[str] words:
     :param dict[str,int] vocab:
-    :param str postfix: 
+    :param str postfix:
     :rtype: (numpy.ndarray, numpy.ndarray)
     """
     unknown_label_id = vocab[self._unknown_label]
@@ -1268,7 +1279,7 @@ class AmbigInputTranslationDataset(TranslationDataset):
         conf_data.append(words_confs)
       with self._lock:
         self._data[k].extend(idx_data)
-      with self._lock:
+#      with self._lock:
         self._data["sparse_weights"].extend(conf_data)
     else: # the classes
       data = [
@@ -1282,7 +1293,7 @@ class AmbigInputTranslationDataset(TranslationDataset):
       return None
     line_nr = self._get_line_nr(seq_idx)
     features = self._get_data(key=self._main_data_key, line_nr=line_nr)
-    targets = {"classes": self._get_data(key="classes", line_nr=line_nr), 
+    targets = {"classes": self._get_data(key="classes", line_nr=line_nr),
                "sparse_weights": self._get_data(key="sparse_weights", line_nr=line_nr)}
     assert features is not None and targets is not None
     return DatasetSeq(
