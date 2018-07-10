@@ -1292,16 +1292,11 @@ class AmbigInputTranslationDataset(TranslationDataset):
     if seq_idx >= self._num_seqs:
       return None
     line_nr = self._get_line_nr(seq_idx)
-    features = self._get_data(key=self._main_data_key, line_nr=line_nr)
-    targets = {"classes": self._get_data(key="classes", line_nr=line_nr),
-               "sparse_weights": self._get_data(key="sparse_weights", line_nr=line_nr)}
-    assert features is not None and targets is not None
+    features = {key: self._get_data(key=key, line_nr=line_nr) for key in self.get_data_keys()}
     return DatasetSeq(
       seq_idx=seq_idx,
       seq_tag="line-%i" % line_nr,
-      features=features,
-      targets=targets)
-
+      features=features, targets=None)
 
 '''
 Cleaners are transformations that run over the input text at both training and eval time.
