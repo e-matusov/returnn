@@ -1185,6 +1185,26 @@ class AmbigInputTranslationDataset(TranslationDataset):
     if "sparse_weights" not in self._data.keys():
       self._data["sparse_weights"] = []
 
+  def is_data_sparse(self, key):
+      if key == "sparse_weights":
+        return False
+      return True  # everything else is sparse
+
+  def get_data_dtype(self, key):
+    if key == "sparse_weights":
+      return "float32"
+    return "int32"  # sparse -> label idx
+
+  def get_data_shape(self, key):
+    if key != "classes":
+      return [self.density]
+    return []
+  
+  def get_data_dim(self, key):
+    if key == "sparse_weights":
+      return super(AmbigInputTranslationDataset, self).get_data_dim(self._main_data_key) # always same dimension as sparase_inputs, read from one file
+    return super(AmbigInputTranslationDataset, self).get_data_dim(key)
+
   def _loadSingleConfusionNet(self, words, vocab, postfix):
     """
     :param list[str] words:
@@ -1248,6 +1268,7 @@ class AmbigInputTranslationDataset(TranslationDataset):
         conf_data.append(words_confs)
       with self._lock:
         self._data[k].extend(idx_data)
+      with self._lock:
         self._data["sparse_weights"].extend(conf_data)
     else: # the classes
       data = [
