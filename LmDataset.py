@@ -1187,12 +1187,6 @@ class AmbigInputTranslationDataset(TranslationDataset):
     if "sparse_weights" not in self._data.keys():
       self._data["sparse_weights"] = []
 
-  def get_data(self, seq_idx, key):
-    if key == self._main_data_key:
-      return self.get_input_data(seq_idx)
-    else:
-      return self.get_targets(key, seq_idx)
-
   def get_data_keys(self):
     return ["sparse_inputs", "sparse_weights", "classes"]
 
