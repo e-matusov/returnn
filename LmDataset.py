@@ -889,7 +889,8 @@ class TranslationDataset(CachedDataset2):
 
   def __init__(self, path, file_postfix, partition_epoch=None, source_postfix="", target_postfix="",
                source_only=False,
-               unknown_label=None, **kwargs):
+               unknown_label=None,
+               seq_list_file=None, **kwargs):
     """
     :param str path: the directory containing the files
     :param str file_postfix: e.g. "train" or "dev". it will then search for "source." + postfix and "target." + postfix.
@@ -900,11 +901,14 @@ class TranslationDataset(CachedDataset2):
       You might want to add some sentence-end symbol.
     :param bool source_only: if targets are not available
     :param str|None unknown_label: "UNK" or so. if not given, then will not replace unknowns but throw an error
+    :param str seq_list_file: filename. line-separated
     """
+
     super(TranslationDataset, self).__init__(**kwargs)
     self.path = path
     self.file_postfix = file_postfix
     self.partition_epoch = partition_epoch
+    self.seq_list = [int(n) for n in open(seq_list_file).read().splitlines()] if (seq_list_file) else None
     if self._main_data_key is None:
       self._main_data_key = "data"
     if self._main_classes_key is None:
@@ -1050,7 +1054,7 @@ class TranslationDataset(CachedDataset2):
       unknown_label_id = vocab[self._unknown_label]
       words_idxs = [vocab.get(w, unknown_label_id) for w in words]
     return numpy.array(words_idxs, dtype=numpy.int32)
-   
+
   def _get_data(self, key, line_nr):
     """
     :param str key: "data" or "classes"
@@ -1132,6 +1136,8 @@ class TranslationDataset(CachedDataset2):
       epoch = 1
     if self.partition_epoch:
       epoch = (epoch - 1) // self.partition_epoch + 1  # count starting from epoch 1
+    if seq_list == None and self.seq_list:
+      seq_list = self.seq_list
     if seq_list is not None:
       self._seq_order = list(seq_list)
       self._num_seqs = len(self._seq_order)
@@ -1165,7 +1171,7 @@ class TranslationDataset(CachedDataset2):
       targets=targets)
 
 class AmbigInputTranslationDataset(TranslationDataset):
-  
+
   def __init__(self, max_density=20, **kwargs):
     """
     :param str path: the directory containing the files
@@ -1204,7 +1210,7 @@ class AmbigInputTranslationDataset(TranslationDataset):
     if key != "classes":
       return [self.density]
     return []
-  
+
   def get_data_dim(self, key):
     if key == "sparse_weights":
       return super(AmbigInputTranslationDataset, self).get_data_dim(self._main_data_key) # always same dimension as sparse_inputs, read from one file
@@ -1251,11 +1257,13 @@ class AmbigInputTranslationDataset(TranslationDataset):
     if postfix != None:
       words.append(postfix)
     unknown_label_id = vocab[self._unknown_label]
-    words_idxs = numpy.zeros(shape=(len(words), self.density), dtype=numpy.int32)
-    words_confs = numpy.zeros(shape=(len(words), self.density), dtype=numpy.float32)
-    for n in range(len(words_idxs)):
-          words_idxs[n][0] = vocab.get(words[n], unknown_label_id)
-          words_confs[n][0] = 1
+#     words_idxs = numpy.zeros(shape=(len(words), self.density), dtype=numpy.int32)
+#     words_confs = numpy.zeros(shape=(len(words), self.density), dtype=numpy.float32)
+#     for n in range(len(words_idxs)):
+#           words_idxs[n][0] = vocab.get(words[n], unknown_label_id)
+#           words_confs[n][0] = 1
+    words_idxs = numpy.array([vocab.get(w, unknown_label_id) for w in words], dtype=numpy.int32)
+    words_confs = None
     return (words_idxs, words_confs)
 
   def _extendData(self, k, data_strs):
@@ -1287,6 +1295,13 @@ class AmbigInputTranslationDataset(TranslationDataset):
       return None
     line_nr = self._get_line_nr(seq_idx)
     features = {key: self._get_data(key=key, line_nr=line_nr) for key in self.get_data_keys()}
+    if features['sparse_weights'] is None:
+      seq = features[self._main_data_key]
+      features[self._main_data_key] = numpy.zeros(shape=(len(seq), self.density), dtype=numpy.int32)
+      features['sparse_weights'] = numpy.zeros(shape=(len(seq), self.density), dtype=numpy.float32)
+      for n in range(len(seq)):
+        features[self._main_data_key][n][0] = seq[n]
+        features['sparse_weights'][n][0] = 1
     return DatasetSeq(
       seq_idx=seq_idx,
       seq_tag="line-%i" % line_nr,
